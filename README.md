@@ -714,21 +714,5 @@ git status
 working tree clean
 ```
 
-## Assignment Submission
-
-The assignment submission requires:
-
-* a public GitHub repository
-* a live deployed `working_url`
-* a root-level `FAILURES.md`
-* a three-minute Loom explanation
-* submission through the PseudoGram `/v1/submit` endpoint
-
-The final submission should use the deployed public base URL rather than the local development URL.
-
-## License
-
-This repository was created as a take-home assignment submission.
-
 ```
 ```
