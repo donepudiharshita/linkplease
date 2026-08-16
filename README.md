@@ -1,77 +1,92 @@
+````markdown
 # LinkPlease
 
-A webhook-driven DM automation service built with FastAPI, SQLAlchemy, PseudoGram, and Alembic.
+A webhook-driven DM automation service built with FastAPI, SQLAlchemy, PostgreSQL/SQLite, and the PseudoGram API.
 
-The service receives comment webhooks, matches configured keywords, creates asynchronous DM jobs, sends DMs through PseudoGram, retries temporary failures, and reconciles accepted DMs until delivery is confirmed.
+The service receives `comment.created` webhook events, matches configured keyword rules, creates database-backed DM jobs, sends DMs through PseudoGram, retries temporary failures, and reconciles accepted DMs until delivery is confirmed.
 
 ## Architecture
 
 ```text
-PseudoGram Webhook
-        |
-        v
-   FastAPI /webhook
-        |
-        +----> Idempotency check
-        |
-        +----> Rule matching
-        |
-        +----> Duplicate-job protection
-        |
-        v
-      SQLite
-        |
-        v
-     DmJob
-        |
-        v
-POST /process-jobs
-        |
-        +----> Send DM to PseudoGram
-        |
-        +----> Retry 429 / 5xx / network failures
-        |
-        v
-     accepted
-        |
-        v
-Delivery reconciliation
-        |
-   +----+----+
-   |         |
-queued   delivered
-             |
-             v
-            sent
-```
+                    PseudoGram Webhook
+                           |
+                           v
+                    FastAPI /webhook
+                           |
+              +------------+------------+
+              |                         |
+              v                         v
+       Idempotency check          Rule matching
+              |                         |
+              +------------+------------+
+                           |
+                           v
+                    PostgreSQL / SQLite
+                           |
+                           v
+                         DmJob
+                           |
+                           v
+                 Embedded background worker
+                           |
+                           v
+                    PseudoGram API
+                           |
+                +----------+----------+
+                |                     |
+              retry                accepted
+                |                     |
+                |                     v
+                |               Delivery check
+                |                     |
+                |              +------+------+
+                |              |             |
+                |           queued       delivered
+                |                            |
+                |                            v
+                |                           sent
+                |
+                +----> retry / failed
+````
+
+For local development, SQLite can be used.
+
+For deployment, PostgreSQL is recommended and configured through `DATABASE_URL`.
 
 ## Features
 
 * FastAPI REST API
-* Webhook processing for `comment.created`
-* Keyword-based rule matching
+* `comment.created` webhook processing
+* Keyword-based automation rules
 * Database-backed DM job queue
 * Webhook idempotency using unique event IDs
-* Database-level duplicate job protection
+* Duplicate-job protection
 * PseudoGram API integration
-* Idempotency keys for DM sends
-* Exponential backoff for temporary server/network failures
-* `429 Retry-After` support
+* Deterministic external idempotency keys
+* Exponential retry backoff
+* HTTP `429 Retry-After` handling
+* HTTP 5xx retry handling
+* Network failure retry handling
 * Maximum retry attempts
 * Accepted vs delivered state separation
-* Delivery status reconciliation
-* Batch job processing
-* Health endpoint
-* SQLite database for local development
-* Alembic database migrations
+* Delivery-status reconciliation
+* Batch worker processing
+* Embedded background worker for deployment
+* Health/readiness endpoint
+* PostgreSQL support
+* SQLite support for local development
+* Alembic migrations
 * Environment-based configuration
-* Automated API and worker tests
+* Automated API tests
+* Automated worker/retry tests
 
 ## Project Structure
 
 ```text
-linkplease-assignment/
+linkplease/
 ├── app/
+│   ├── __init__.py
+│   ├── background_worker.py
 │   ├── config.py
 │   ├── database.py
 │   ├── main.py
@@ -81,7 +96,10 @@ linkplease-assignment/
 │   └── worker.py
 ├── alembic/
 │   ├── versions/
-│   └── env.py
+│   │   └── 6b719c7bf977_strengthen_database_constraints_and_.py
+│   ├── env.py
+│   ├── README
+│   └── script.py.mako
 ├── tests/
 │   ├── __init__.py
 │   ├── conftest.py
@@ -91,16 +109,20 @@ linkplease-assignment/
 ├── .env.example
 ├── .gitignore
 ├── alembic.ini
-├── requirements.txt
-└── README.md
+├── FAILURES.md
+├── README.md
+├── render.yaml
+└── requirements.txt
 ```
 
 ## Requirements
 
 * Python 3.14+
-* PseudoGram API credentials
+* A PseudoGram API key
+* PostgreSQL for deployed environments
+* SQLite for local development/testing
 
-## Setup
+## Local Setup
 
 Create and activate a virtual environment:
 
@@ -125,36 +147,68 @@ Example:
 PSEUDOGRAM_API_KEY=your_real_api_key
 PSEUDOGRAM_BASE_URL=https://pseudogram-api.onrender.com
 PSEUDOGRAM_TIMEOUT_SECONDS=10
+
 DATABASE_URL=sqlite:///./linkplease.db
+
+RUN_BACKGROUND_WORKER=false
+WORKER_POLL_INTERVAL_SECONDS=2
 ```
 
-Do not commit `.env`.
+Never commit `.env`.
 
 Use `.env.example` as the safe configuration template.
 
 ## Database
 
-The application uses SQLite by default:
+### Local development
+
+SQLite is used by default:
 
 ```text
 sqlite:///./linkplease.db
 ```
 
-Database schema changes are managed with Alembic.
+### Deployment
 
-Apply migrations with:
+Set:
 
-```powershell
-alembic upgrade head
+```text
+DATABASE_URL=<PostgreSQL connection string>
 ```
 
-Check the current migration revision:
+The application normalizes standard `postgres://` and `postgresql://` URLs to the SQLAlchemy Psycopg driver format.
+
+## Database Migrations
+
+Alembic manages the application schema.
+
+Check the current revision:
 
 ```powershell
 alembic current
 ```
 
-## Running the Application
+Check whether model metadata and the migration state match:
+
+```powershell
+alembic check
+```
+
+Apply migrations:
+
+```powershell
+alembic upgrade head
+```
+
+Create a new migration during development:
+
+```powershell
+alembic revision --autogenerate -m "describe schema change"
+```
+
+The deployed application runs migrations before starting the FastAPI server.
+
+## Running Locally
 
 Start the API:
 
@@ -162,35 +216,56 @@ Start the API:
 uvicorn app.main:app --reload
 ```
 
-The API will be available at:
+The API is available at:
 
 ```text
 http://127.0.0.1:8000
 ```
 
-Interactive API documentation:
+Interactive Swagger documentation:
 
 ```text
 http://127.0.0.1:8000/docs
 ```
 
-Health check:
+## Running the Background Worker Locally
+
+The embedded background worker is disabled during normal local development by default.
+
+To enable it:
 
 ```text
-GET /health
+RUN_BACKGROUND_WORKER=true
+```
+
+The worker polls the database for pending work and processes jobs automatically.
+
+The manual endpoint remains available for development/testing:
+
+```text
+POST /process-jobs
 ```
 
 ## API Endpoints
 
 ### `GET /`
 
-Basic application information.
+Returns basic application information.
+
+Example:
+
+```json
+{
+  "message": "LinkPlease API is running",
+  "version": "1.0.0"
+}
+```
 
 ### `GET /health`
 
-Lightweight health endpoint.
+Checks that the application can reach its database.
 
-Example response:
+Example:
 
 ```json
 {
@@ -198,9 +273,11 @@ Example response:
 }
 ```
 
+If the database is unavailable, the endpoint returns `503 Service Unavailable`.
+
 ### `POST /rules`
 
-Create a keyword-triggered DM rule.
+Creates a keyword-triggered DM rule.
 
 Example:
 
@@ -213,7 +290,7 @@ Example:
 
 ### `POST /webhook`
 
-Accept a webhook event from PseudoGram.
+Receives a PseudoGram webhook event.
 
 Example:
 
@@ -237,16 +314,17 @@ Example:
 
 The webhook:
 
-1. Validates the event.
-2. Checks whether the event was already processed.
-3. Stores the event inside the same transaction as job creation.
-4. Matches configured rules.
+1. Validates the payload.
+2. Checks whether `event_id` has already been processed.
+3. Records the event.
+4. Matches configured keyword rules.
 5. Prevents duplicate jobs for the same rule and user.
-6. Returns immediately without sending the DM synchronously.
+6. Stores matching DM jobs in the database.
+7. Returns without waiting for the external DM delivery.
 
 ### `POST /process-jobs`
 
-Processes queued/retry jobs and reconciles accepted DMs.
+Manually triggers one worker cycle.
 
 Example response:
 
@@ -256,9 +334,11 @@ Example response:
 }
 ```
 
+This endpoint is retained for development and verification. In deployment, the embedded worker normally processes jobs automatically.
+
 ### `GET /stats`
 
-Returns current processing statistics.
+Returns the current processing counters.
 
 Example:
 
@@ -271,6 +351,15 @@ Example:
 }
 ```
 
+`queued` includes jobs currently in:
+
+```text
+queued
+processing
+retry
+accepted
+```
+
 ## Job Lifecycle
 
 A DM job follows this lifecycle:
@@ -281,25 +370,25 @@ queued
    v
 processing
    |
-   +----> retry ----+
-   |                |
-   |                v
-   |           processing
+   +-----> retry --------+
+   |                     |
+   |                     v
+   |                processing
    |
-   +----> accepted
-             |
-             v
-       reconciliation
-             |
-        +----+----+
-        |         |
-     queued    delivered
-                  |
-                  v
-                 sent
+   +-----> accepted
+               |
+               v
+       delivery reconciliation
+               |
+          +----+----+
+          |         |
+        queued   delivered
+                     |
+                     v
+                    sent
 ```
 
-A permanent error moves the job to:
+Permanent errors move the job to:
 
 ```text
 failed
@@ -307,9 +396,9 @@ failed
 
 ## Retry Strategy
 
-Temporary failures are retried with bounded exponential backoff.
+Temporary failures use bounded exponential backoff.
 
-Current retry delays are approximately:
+Typical retry delays:
 
 ```text
 attempt 1 -> 2 seconds
@@ -319,49 +408,61 @@ attempt 4 -> 16 seconds
 attempt 5 -> 32 seconds
 ```
 
-The retry delay is capped.
+The worker caps retry delay.
 
 ### HTTP 429
 
-The worker reads the `Retry-After` header when available and schedules the next attempt accordingly.
+The `Retry-After` response header is used when available.
 
 ### HTTP 5xx
 
-Server failures use exponential backoff until the maximum attempt count is reached.
+Server failures are retried using exponential backoff until the maximum attempt count is reached.
 
 ### Network errors
 
-Network failures are treated as retryable.
+Network-level failures are considered retryable.
 
 ### Permanent 4xx errors
 
-Client-side errors other than `429` are treated as permanent failures.
+Client errors other than `429` are treated as permanent failures.
 
 ## Idempotency
 
-Two layers protect against duplicate processing.
+The application uses multiple layers of duplicate protection.
 
 ### Webhook idempotency
 
-`ProcessedEvent.event_id` is unique in the database.
+`ProcessedEvent.event_id` is unique.
 
-This means repeated delivery of the same webhook event does not create another processing operation.
+Sending the same event again returns:
 
-### DM job idempotency
+```json
+{
+  "status": "duplicate_event"
+}
+```
 
-`DmJob` has a unique `(rule_id, user_id)` constraint.
+### Duplicate DM job protection
 
-Additionally, each job is sent to PseudoGram using a deterministic idempotency key:
+A unique `(rule_id, user_id)` constraint prevents multiple jobs for the same user/rule combination.
+
+### External DM idempotency
+
+Each job uses:
 
 ```text
 dm-job-{job_id}
 ```
 
-This protects the external send operation when the application retries after a network failure.
+as its PseudoGram idempotency key.
+
+This protects the external send operation when an application retry occurs after a request may already have reached PseudoGram.
 
 ## Delivery Reconciliation
 
-A successful PseudoGram send response means the request was accepted, not necessarily delivered.
+A successful PseudoGram send means the external service accepted the DM request.
+
+It does not necessarily mean the DM was delivered.
 
 Therefore:
 
@@ -369,7 +470,7 @@ Therefore:
 accepted != sent
 ```
 
-Accepted jobs are checked again through the PseudoGram delivery-status API.
+The worker periodically checks the delivery endpoint.
 
 Only when PseudoGram reports:
 
@@ -377,15 +478,15 @@ Only when PseudoGram reports:
 delivered
 ```
 
-does the job transition to:
+does the local job become:
 
 ```text
 sent
 ```
 
-## Database Design
+This prevents the application from treating API acceptance as confirmed delivery.
 
-The main tables are:
+## Database Design
 
 ### `rules`
 
@@ -393,32 +494,32 @@ Stores keyword-triggered DM rules.
 
 ### `processed_events`
 
-Stores webhook event IDs to provide idempotency.
+Stores webhook event IDs used for idempotency.
 
 ### `dm_jobs`
 
 Stores asynchronous DM work, including:
 
-* rule
-* user
-* comment
+* rule ID
+* comment ID
+* user ID
 * message
 * status
-* attempts
+* attempt count
 * retry time
-* PseudoGram DM ID
+* external DM ID
 * last error
 * creation time
 
 ### `stats`
 
-Stores the duplicate-event/job reporting counter.
+Stores duplicate-protection statistics.
 
-The database also uses indexes for common worker and reconciliation lookups.
+Indexes are included for common worker, reconciliation, user, comment, and status lookups.
 
 ## Testing
 
-The test suite covers both API behavior and worker reliability.
+The project contains automated API and worker tests.
 
 Run:
 
@@ -426,81 +527,204 @@ Run:
 pytest -q
 ```
 
-The current suite covers:
+The current suite contains **28 passing tests** covering:
 
-* health endpoint
+* health/readiness behavior
+* home endpoint
 * rule creation
 * rule validation
 * webhook validation
 * keyword matching
 * case-insensitive matching
-* multiple rule matches
+* multiple matching rules
+* non-matching comments
 * duplicate webhook events
 * duplicate user/rule jobs
 * unsupported event types
 * statistics
 * successful DM acceptance
-* `500` retry behavior
-* `429 Retry-After`
+* HTTP 500 retry
+* HTTP 429 `Retry-After`
 * network failures
-* maximum attempts
-* permanent `4xx` failures
+* maximum retry attempts
+* permanent 4xx failures
 * delivery reconciliation
+* accepted/queued delivery status
 * delivery failures
+* delivery network errors
 * malformed API responses
 * missing `dm_id`
 * unknown delivery states
 
-## Configuration and Security
+The current local verification result is:
 
-Secrets are loaded from environment variables.
+```text
+28 passed
+```
 
-The real `.env` file is excluded from Git.
+## Deployment
 
-The repository should contain `.env.example`, but never a real API key.
+The repository includes `render.yaml` for Render deployment.
 
-The local SQLite database is also excluded from Git.
+The intended deployment architecture is:
 
-## Production Considerations
+```text
+Render Web Service
+        |
+        +---- FastAPI application
+        |
+        +---- Embedded background worker
+        |
+        v
+Render PostgreSQL
+        |
+        v
+PseudoGram API
+```
 
-The project is intentionally small and assignment-friendly while using production-oriented reliability patterns.
+The deployment uses:
 
-Important design decisions include:
+```text
+DATABASE_URL
+PSEUDOGRAM_API_KEY
+PSEUDOGRAM_BASE_URL
+PSEUDOGRAM_TIMEOUT_SECONDS
+RUN_BACKGROUND_WORKER
+WORKER_POLL_INTERVAL_SECONDS
+```
 
-* database-backed idempotency
-* transaction-safe webhook processing
-* bounded retries
-* rate-limit handling
-* external API timeouts
-* delivery reconciliation
-* database indexes
-* database migrations
-* environment-based configuration
-* automated tests
+The real PseudoGram API key is supplied through Render environment variables and is never committed to Git.
 
-For higher-scale deployments, the database can be moved from SQLite to PostgreSQL by changing `DATABASE_URL` and applying the appropriate migrations. A dedicated worker/queue system could also replace the manual `/process-jobs` trigger.
+The deployed service runs:
+
+```text
+alembic upgrade head
+```
+
+before starting Uvicorn.
+
+The application binds to:
+
+```text
+0.0.0.0:$PORT
+```
+
+for the hosting environment.
+
+## Render Environment
+
+For the deployed service:
+
+```text
+PSEUDOGRAM_API_KEY=<secret>
+PSEUDOGRAM_BASE_URL=https://pseudogram-api.onrender.com
+PSEUDOGRAM_TIMEOUT_SECONDS=10
+
+DATABASE_URL=<Render PostgreSQL connection string>
+
+RUN_BACKGROUND_WORKER=true
+WORKER_POLL_INTERVAL_SECONDS=2
+```
+
+The health check endpoint is:
+
+```text
+/health
+```
+
+## Failure Transparency
+
+The repository includes:
+
+```text
+FAILURES.md
+```
+
+This documents known failure modes instead of claiming that the system handles every possible edge case.
+
+Known limitations include worker concurrency, multiple web replicas, external acceptance followed by local database failure, transient statistics during active processing, prolonged delivery reconciliation failures, and the limitations of SQLite for production concurrency.
+
+## Security
+
+Secrets are loaded through environment variables.
+
+The repository intentionally does not contain:
+
+* the real PseudoGram API key
+* local SQLite databases
+* database backups
+* virtual environments
+
+`.env.example` contains placeholders only.
 
 ## Development Verification
 
-The application has been manually verified through the following flows:
+The implementation has been manually verified through the complete flow:
 
 ```text
 Webhook received
-    -> rule matched
-    -> DM job created
-    -> worker processed job
-    -> PseudoGram accepted DM
-    -> delivery reconciled
-    -> job marked sent
+    ↓
+Rule matched
+    ↓
+DM job created
+    ↓
+Worker processes job
+    ↓
+PseudoGram accepts DM
+    ↓
+Delivery reconciliation
+    ↓
+Job marked sent
 ```
 
-Duplicate webhook delivery was also verified and returned:
+Duplicate webhook delivery was also verified and correctly returned:
 
 ```json
 {
   "status": "duplicate_event"
 }
 ```
+
+A previously completed verification produced:
+
+```json
+{
+  "sent": 6,
+  "failed": 0,
+  "queued": 0,
+  "duplicates_blocked": 2
+}
+```
+
+## Current Validation
+
+The project is considered locally verified when all of the following are true:
+
+```text
+pytest -q
+28 passed
+
+alembic current
+6b719c7bf977 (head)
+
+alembic check
+No new upgrade operations detected.
+
+git status
+working tree clean
+```
+
+## Assignment Submission
+
+The assignment submission requires:
+
+* a public GitHub repository
+* a live deployed `working_url`
+* a root-level `FAILURES.md`
+* a three-minute Loom explanation
+* submission through the PseudoGram `/v1/submit` endpoint
+
+The final submission should use the deployed public base URL rather than the local development URL.
 
 ## License
 
