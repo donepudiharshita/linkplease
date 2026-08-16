@@ -1,17 +1,66 @@
+import asyncio
+from contextlib import asynccontextmanager
+import logging
+
 from fastapi import Depends, FastAPI, HTTPException, status
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from . import models
+from .background_worker import run_worker_once
+from .config import (
+    RUN_BACKGROUND_WORKER,
+)
 from .database import get_db
 from .schemas import RuleCreate, RuleResponse, WebhookEvent
-from .worker import process_jobs
+
+
+logger = logging.getLogger(__name__)
+
+
+async def background_worker_loop() -> None:
+    """
+    Run the database-backed worker without blocking FastAPI's
+    event loop.
+    """
+
+    while True:
+        await asyncio.to_thread(
+            run_worker_once
+        )
+
+        await asyncio.sleep(2)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    worker_task = None
+
+    if RUN_BACKGROUND_WORKER:
+        logger.info(
+            "Starting embedded background worker"
+        )
+
+        worker_task = asyncio.create_task(
+            background_worker_loop()
+        )
+
+    yield
+
+    if worker_task is not None:
+        worker_task.cancel()
+
+        try:
+            await worker_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(
     title="LinkPlease Assignment",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 
@@ -20,6 +69,34 @@ def home():
     return {
         "message": "LinkPlease API is running",
         "version": "1.0.0",
+    }
+
+
+@app.get("/health")
+def health_check(
+    db: Session = Depends(get_db),
+):
+    """
+    Readiness/health endpoint.
+
+    Verifies both the API process and database connection.
+    """
+
+    try:
+        db.execute(text("SELECT 1"))
+
+    except Exception:
+        logger.exception(
+            "Health check database query failed"
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database unavailable",
+        )
+
+    return {
+        "status": "healthy",
     }
 
 
@@ -32,13 +109,6 @@ def create_rule(
     rule: RuleCreate,
     db: Session = Depends(get_db),
 ):
-    """
-    Create a keyword -> DM rule.
-
-    Rules are stored in the database and are later evaluated
-    when comment.created webhook events arrive.
-    """
-
     keyword = rule.keyword.strip()
     dm_message = rule.dm_message.strip()
 
@@ -70,7 +140,10 @@ def create_rule(
 
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Could not create rule because of a database constraint",
+            detail=(
+                "Could not create rule because "
+                "of a database constraint"
+            ),
         )
 
     except Exception:
@@ -89,18 +162,6 @@ def receive_webhook(
     event: WebhookEvent,
     db: Session = Depends(get_db),
 ):
-    """
-    Receive and process a PseudoGram webhook event.
-
-    Important guarantees:
-
-    1. Event IDs are idempotent.
-    2. Duplicate events are ignored.
-    3. Unsupported event types are recorded but ignored.
-    4. Matching rules create asynchronous DM jobs.
-    5. Database constraints provide the final duplicate protection.
-    """
-
     existing_event = (
         db.query(models.ProcessedEvent)
         .filter(
@@ -121,9 +182,6 @@ def receive_webhook(
 
         db.add(processed_event)
 
-        # Record unsupported events as processed so that
-        # repeated delivery of the same webhook does not
-        # repeatedly execute application logic.
         if event.event_type != "comment.created":
             db.commit()
 
@@ -135,10 +193,11 @@ def receive_webhook(
             event.data.text or ""
         ).strip()
 
+        normalized_comment = comment_text.casefold()
+
         user_id = event.data.from_.user_id
         comment_id = event.data.comment_id
 
-        # Load all currently configured rules.
         rules = (
             db.query(models.Rule)
             .order_by(models.Rule.id)
@@ -148,8 +207,6 @@ def receive_webhook(
         matched_rules = []
         jobs_created = []
         duplicates_blocked = 0
-
-        normalized_comment = comment_text.casefold()
 
         for rule in rules:
             normalized_keyword = (
@@ -200,8 +257,9 @@ def receive_webhook(
             )
 
             db.add(job)
+            db.flush()
 
-            jobs_created.append(rule.id)
+            jobs_created.append(job.id)
 
         db.commit()
 
@@ -213,14 +271,6 @@ def receive_webhook(
         }
 
     except IntegrityError:
-        """
-        Concurrent webhook requests can both observe that an
-        event does not exist and then attempt to insert it.
-
-        The database UNIQUE constraint on event_id is the final
-        source of truth for idempotency.
-        """
-
         db.rollback()
 
         existing_event = (
@@ -238,7 +288,10 @@ def receive_webhook(
 
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Webhook could not be processed because of a database conflict",
+            detail=(
+                "Webhook could not be processed "
+                "because of a database conflict"
+            ),
         )
 
     except Exception:
@@ -251,14 +304,12 @@ def process_jobs_endpoint(
     db: Session = Depends(get_db),
 ):
     """
-    Process queued/retry DM jobs and reconcile accepted DMs.
-
-    In a production deployment this operation would normally
-    run in a dedicated worker process or scheduler rather than
-    being triggered manually through the API.
+    Manual worker trigger retained for debugging and testing.
     """
 
     try:
+        from .worker import process_jobs
+
         process_jobs(db)
 
     except Exception:
@@ -274,16 +325,13 @@ def process_jobs_endpoint(
 def get_stats(
     db: Session = Depends(get_db),
 ):
-    """
-    Return current DM processing statistics.
-    """
-
     sent = (
         db.query(func.count(models.DmJob.id))
         .filter(
             models.DmJob.status == "sent",
         )
         .scalar()
+        or 0
     )
 
     failed = (
@@ -292,6 +340,7 @@ def get_stats(
             models.DmJob.status == "failed",
         )
         .scalar()
+        or 0
     )
 
     queued = (
@@ -307,6 +356,7 @@ def get_stats(
             ),
         )
         .scalar()
+        or 0
     )
 
     stat = (
@@ -321,23 +371,8 @@ def get_stats(
     )
 
     return {
-        "sent": sent or 0,
-        "failed": failed or 0,
-        "queued": queued or 0,
-        "duplicates_blocked": duplicates_blocked or 0,
-    }
-
-
-@app.get("/health")
-def health_check():
-    """
-    Basic application health endpoint.
-
-    This verifies that the FastAPI application process is
-    responding. Database dependency health is intentionally
-    kept separate from this lightweight endpoint.
-    """
-
-    return {
-        "status": "healthy",
+        "sent": sent,
+        "failed": failed,
+        "queued": queued,
+        "duplicates_blocked": duplicates_blocked,
     }

@@ -1,0 +1,44 @@
+services:
+  - type: web
+    name: linkplease-api
+    runtime: python
+    plan: free
+    region: singapore
+
+    buildCommand: pip install -r requirements.txt
+
+    startCommand: >
+      alembic upgrade head &&
+      uvicorn app.main:app --host 0.0.0.0 --port $PORT
+
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: linkplease-db
+          property: connectionString
+
+      - key: PSEUDOGRAM_API_KEY
+        sync: false
+
+      - key: PSEUDOGRAM_BASE_URL
+        value: https://pseudogram-api.onrender.com
+
+      - key: PSEUDOGRAM_TIMEOUT_SECONDS
+        value: "10"
+
+      - key: RUN_BACKGROUND_WORKER
+        value: "true"
+
+      - key: WORKER_POLL_INTERVAL_SECONDS
+        value: "2"
+
+
+databases:
+  - name: linkplease-db
+    plan: free
+    region: singapore
+    databaseName: linkplease
+    user: linkplease

@@ -1,17 +1,10 @@
-import os
-
-from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
+from .config import sqlalchemy_database_url
 
-load_dotenv()
 
-
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "sqlite:///./linkplease.db",
-)
+DATABASE_URL = sqlalchemy_database_url()
 
 
 engine_kwargs = {
@@ -22,6 +15,15 @@ if DATABASE_URL.startswith("sqlite"):
     engine_kwargs["connect_args"] = {
         "check_same_thread": False,
     }
+else:
+    engine_kwargs.update(
+        {
+            "pool_size": 3,
+            "max_overflow": 2,
+            "pool_timeout": 30,
+        }
+    )
+
 
 engine = create_engine(
     DATABASE_URL,
@@ -43,9 +45,6 @@ Base = declarative_base()
 def get_db():
     """
     Provide one SQLAlchemy session per request.
-
-    The session is always closed after the request,
-    including when an exception occurs.
     """
 
     db = SessionLocal()
