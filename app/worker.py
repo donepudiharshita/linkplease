@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import logging
 
@@ -5,6 +6,7 @@ import httpx
 from sqlalchemy.orm import Session
 
 from . import models
+from .database import SessionLocal
 from .mock_api import get_dm_status, send_dm
 
 
@@ -13,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 5
 BATCH_SIZE = 50
+WORKER_CONCURRENCY = 5
 
 RECONCILE_DELAY_SECONDS = 10
 MAX_RETRY_DELAY_SECONDS = 60
@@ -20,10 +23,14 @@ MAX_RATE_LIMIT_DELAY_SECONDS = 3600
 
 
 def utc_now() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    return datetime.now(
+        timezone.utc
+    ).replace(tzinfo=None)
 
 
-def calculate_retry_delay(attempts: int) -> int:
+def calculate_retry_delay(
+    attempts: int,
+) -> int:
     """
     Bounded exponential backoff.
 
@@ -47,8 +54,9 @@ def schedule_retry(
     delay: int,
 ) -> None:
     job.status = "retry"
-    job.next_retry_at = utc_now() + timedelta(
-        seconds=delay,
+    job.next_retry_at = (
+        utc_now()
+        + timedelta(seconds=delay)
     )
     job.last_error = error
 
@@ -81,7 +89,8 @@ def reconcile_accepted_jobs(
             (
                 models.DmJob.next_retry_at.is_(None)
                 | (
-                    models.DmJob.next_retry_at <= now
+                    models.DmJob.next_retry_at
+                    <= now
                 )
             ),
         )
@@ -98,7 +107,9 @@ def reconcile_accepted_jobs(
                 job.dm_id,
             )
 
-            response = get_dm_status(job.dm_id)
+            response = get_dm_status(
+                job.dm_id
+            )
 
             logger.info(
                 "Delivery status job_id=%s status_code=%s",
@@ -121,6 +132,7 @@ def reconcile_accepted_jobs(
 
             try:
                 data = response.json()
+
             except ValueError as exc:
                 schedule_retry(
                     job,
@@ -153,7 +165,7 @@ def reconcile_accepted_jobs(
                 job.next_retry_at = (
                     utc_now()
                     + timedelta(
-                        seconds=RECONCILE_DELAY_SECONDS,
+                        seconds=RECONCILE_DELAY_SECONDS
                     )
                 )
                 job.last_error = None
@@ -173,13 +185,14 @@ def reconcile_accepted_jobs(
                     db.commit()
 
                     logger.error(
-                        "DM permanently failed job_id=%s",
+                        "DM permanently failed "
+                        "job_id=%s",
                         job.id,
                     )
 
                 else:
                     delay = calculate_retry_delay(
-                        job.attempts,
+                        job.attempts
                     )
 
                     schedule_retry(
@@ -253,7 +266,9 @@ def reconcile_accepted_jobs(
             )
 
 
-def get_pending_jobs(db: Session):
+def get_pending_jobs(
+    db: Session,
+):
     """
     Fetch a bounded batch of jobs ready for processing.
     """
@@ -264,12 +279,13 @@ def get_pending_jobs(db: Session):
         db.query(models.DmJob)
         .filter(
             models.DmJob.status.in_(
-                ["queued", "retry"],
+                ["queued", "retry"]
             ),
             (
                 models.DmJob.next_retry_at.is_(None)
                 | (
-                    models.DmJob.next_retry_at <= now
+                    models.DmJob.next_retry_at
+                    <= now
                 )
             ),
             models.DmJob.attempts < MAX_ATTEMPTS,
@@ -285,7 +301,7 @@ def process_single_job(
     job: models.DmJob,
 ) -> None:
     """
-    Process one DM job.
+    Process one DM job using the supplied SQLAlchemy session.
     """
 
     logger.info(
@@ -317,6 +333,7 @@ def process_single_job(
         if response.status_code in (200, 202):
             try:
                 data = response.json()
+
             except ValueError as exc:
                 error = (
                     "Invalid PseudoGram success response: "
@@ -324,13 +341,17 @@ def process_single_job(
                 )
 
                 if job.attempts >= MAX_ATTEMPTS:
-                    mark_failed(job, error)
+                    mark_failed(
+                        job,
+                        error,
+                    )
+
                 else:
                     schedule_retry(
                         job,
                         error=error,
                         delay=calculate_retry_delay(
-                            job.attempts,
+                            job.attempts
                         ),
                     )
 
@@ -346,13 +367,17 @@ def process_single_job(
                 )
 
                 if job.attempts >= MAX_ATTEMPTS:
-                    mark_failed(job, error)
+                    mark_failed(
+                        job,
+                        error,
+                    )
+
                 else:
                     schedule_retry(
                         job,
                         error=error,
                         delay=calculate_retry_delay(
-                            job.attempts,
+                            job.attempts
                         ),
                     )
 
@@ -365,7 +390,7 @@ def process_single_job(
             job.next_retry_at = (
                 utc_now()
                 + timedelta(
-                    seconds=RECONCILE_DELAY_SECONDS,
+                    seconds=RECONCILE_DELAY_SECONDS
                 )
             )
 
@@ -386,8 +411,14 @@ def process_single_job(
             )
 
             try:
-                retry_seconds = int(retry_after)
-            except (TypeError, ValueError):
+                retry_seconds = int(
+                    retry_after
+                )
+
+            except (
+                TypeError,
+                ValueError,
+            ):
                 retry_seconds = 60
 
             retry_seconds = max(
@@ -417,13 +448,16 @@ def process_single_job(
 
         if response.status_code >= 500:
             error = (
-                f"Server error from PseudoGram: "
+                "Server error from PseudoGram: "
                 f"HTTP {response.status_code}: "
                 f"{response.text}"
             )
 
             if job.attempts >= MAX_ATTEMPTS:
-                mark_failed(job, error)
+                mark_failed(
+                    job,
+                    error,
+                )
 
                 db.commit()
 
@@ -436,7 +470,7 @@ def process_single_job(
 
             else:
                 delay = calculate_retry_delay(
-                    job.attempts,
+                    job.attempts
                 )
 
                 schedule_retry(
@@ -457,7 +491,7 @@ def process_single_job(
             return
 
         error = (
-            f"Permanent PseudoGram error: "
+            "Permanent PseudoGram error: "
             f"HTTP {response.status_code}: "
             f"{response.text}"
         )
@@ -485,13 +519,17 @@ def process_single_job(
 
         try:
             if job.attempts >= MAX_ATTEMPTS:
-                mark_failed(job, error)
+                mark_failed(
+                    job,
+                    error,
+                )
+
             else:
                 schedule_retry(
                     job,
                     error=error,
                     delay=calculate_retry_delay(
-                        job.attempts,
+                        job.attempts
                     ),
                 )
 
@@ -515,17 +553,120 @@ def process_single_job(
         )
 
 
-def process_jobs(db: Session) -> None:
+def process_single_job_by_id(
+    job_id: int,
+) -> None:
+    """
+    Process one job using an isolated database session.
+
+    A separate session is required because SQLAlchemy sessions
+    must not be shared between worker threads.
+    """
+
+    db = SessionLocal()
+
+    try:
+        job = (
+            db.query(models.DmJob)
+            .filter(
+                models.DmJob.id == job_id,
+            )
+            .first()
+        )
+
+        if job is None:
+            logger.warning(
+                "Worker job disappeared before processing "
+                "job_id=%s",
+                job_id,
+            )
+            return
+
+        if job.status not in (
+            "queued",
+            "retry",
+        ):
+            logger.info(
+                "Skipping job_id=%s status=%s",
+                job_id,
+                job.status,
+            )
+            return
+
+        now = utc_now()
+
+        if (
+            job.next_retry_at is not None
+            and job.next_retry_at > now
+        ):
+            return
+
+        if job.attempts >= MAX_ATTEMPTS:
+            return
+
+        process_single_job(
+            db,
+            job,
+        )
+
+    except Exception:
+        db.rollback()
+
+        logger.exception(
+            "Worker task failed job_id=%s",
+            job_id,
+        )
+
+    finally:
+        db.close()
+
+
+def process_jobs(
+    db: Session,
+) -> None:
     """
     Reconcile accepted DMs and process pending jobs.
+
+    Pending jobs are processed concurrently with a bounded
+    worker pool. Each job gets its own database session.
     """
 
     reconcile_accepted_jobs(db)
 
     jobs = get_pending_jobs(db)
 
-    for job in jobs:
-        process_single_job(
-            db,
-            job,
-        )
+    job_ids = [
+        job.id
+        for job in jobs
+    ]
+
+    if not job_ids:
+        return
+
+    logger.info(
+        "Dispatching %s jobs with concurrency=%s",
+        len(job_ids),
+        WORKER_CONCURRENCY,
+    )
+
+    with ThreadPoolExecutor(
+        max_workers=WORKER_CONCURRENCY,
+        thread_name_prefix="dm-worker",
+    ) as executor:
+        futures = [
+            executor.submit(
+                process_single_job_by_id,
+                job_id,
+            )
+            for job_id in job_ids
+        ]
+
+        for future in futures:
+            try:
+                future.result()
+
+            except Exception:
+                logger.exception(
+                    "Unexpected worker future failure"
+                )
+
