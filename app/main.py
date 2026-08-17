@@ -9,9 +9,7 @@ from sqlalchemy.orm import Session
 
 from . import models
 from .background_worker import run_worker_once
-from .config import (
-    RUN_BACKGROUND_WORKER,
-)
+from .config import RUN_BACKGROUND_WORKER
 from .database import get_db
 from .schemas import RuleCreate, RuleResponse, WebhookEvent
 
@@ -21,14 +19,42 @@ logger = logging.getLogger(__name__)
 
 async def background_worker_loop() -> None:
     """
-    Run the database-backed worker without blocking FastAPI's
-    event loop.
+    Run the database-backed worker continuously.
     """
 
+    print(
+        "BACKGROUND_WORKER_LOOP_STARTED",
+        flush=True,
+    )
+
     while True:
-        await asyncio.to_thread(
-            run_worker_once
-        )
+        try:
+            print(
+                "BACKGROUND_WORKER_CYCLE_START",
+                flush=True,
+            )
+
+            await asyncio.to_thread(
+                run_worker_once,
+            )
+
+            print(
+                "BACKGROUND_WORKER_CYCLE_FINISHED",
+                flush=True,
+            )
+
+        except asyncio.CancelledError:
+            print(
+                "BACKGROUND_WORKER_LOOP_CANCELLED",
+                flush=True,
+            )
+            raise
+
+        except Exception as exc:
+            print(
+                f"BACKGROUND_WORKER_CYCLE_ERROR: {exc}",
+                flush=True,
+            )
 
         await asyncio.sleep(2)
 
@@ -37,18 +63,35 @@ async def background_worker_loop() -> None:
 async def lifespan(app: FastAPI):
     worker_task = None
 
+    print(
+        f"APPLICATION_STARTUP RUN_BACKGROUND_WORKER={RUN_BACKGROUND_WORKER}",
+        flush=True,
+    )
+
     if RUN_BACKGROUND_WORKER:
-        logger.info(
-            "Starting embedded background worker"
+        print(
+            "BACKGROUND_WORKER_STARTING",
+            flush=True,
         )
 
         worker_task = asyncio.create_task(
             background_worker_loop()
         )
 
+    else:
+        print(
+            "BACKGROUND_WORKER_DISABLED",
+            flush=True,
+        )
+
     yield
 
     if worker_task is not None:
+        print(
+            "BACKGROUND_WORKER_STOPPING",
+            flush=True,
+        )
+
         worker_task.cancel()
 
         try:
@@ -77,9 +120,7 @@ def health_check(
     db: Session = Depends(get_db),
 ):
     """
-    Readiness/health endpoint.
-
-    Verifies both the API process and database connection.
+    Verify that the application process and database are healthy.
     """
 
     try:
@@ -97,6 +138,17 @@ def health_check(
 
     return {
         "status": "healthy",
+    }
+
+
+@app.get("/worker-status")
+def worker_status():
+    """
+    Diagnostic endpoint used to verify deployment configuration.
+    """
+
+    return {
+        "background_worker_enabled": RUN_BACKGROUND_WORKER,
     }
 
 
@@ -165,7 +217,8 @@ def receive_webhook(
     existing_event = (
         db.query(models.ProcessedEvent)
         .filter(
-            models.ProcessedEvent.event_id == event.event_id
+            models.ProcessedEvent.event_id
+            == event.event_id
         )
         .first()
     )
@@ -193,7 +246,9 @@ def receive_webhook(
             event.data.text or ""
         ).strip()
 
-        normalized_comment = comment_text.casefold()
+        normalized_comment = (
+            comment_text.casefold()
+        )
 
         user_id = event.data.from_.user_id
         comment_id = event.data.comment_id
@@ -276,7 +331,8 @@ def receive_webhook(
         existing_event = (
             db.query(models.ProcessedEvent)
             .filter(
-                models.ProcessedEvent.event_id == event.event_id
+                models.ProcessedEvent.event_id
+                == event.event_id
             )
             .first()
         )
@@ -304,7 +360,7 @@ def process_jobs_endpoint(
     db: Session = Depends(get_db),
 ):
     """
-    Manual worker trigger retained for debugging and testing.
+    Manual worker trigger retained for testing/debugging.
     """
 
     try:
@@ -376,3 +432,4 @@ def get_stats(
         "queued": queued,
         "duplicates_blocked": duplicates_blocked,
     }
+
