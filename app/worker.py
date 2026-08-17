@@ -70,6 +70,61 @@ def mark_failed(
     job.last_error = error
 
 
+def recover_stuck_processing_jobs(
+    db: Session,
+) -> None:
+    """
+    Recover jobs left in processing after a worker restart.
+
+    A process restart can leave jobs in processing before their
+    final state is committed. Those jobs are moved back to retry
+    unless they already reached the maximum attempt count.
+
+    The external PseudoGram idempotency key remains the final
+    protection if the previous send reached PseudoGram before
+    the worker stopped.
+    """
+
+    jobs = (
+        db.query(models.DmJob)
+        .filter(
+            models.DmJob.status == "processing",
+        )
+        .all()
+    )
+
+    if not jobs:
+        return
+
+    recovered = 0
+    failed = 0
+
+    for job in jobs:
+        if job.attempts >= MAX_ATTEMPTS:
+            mark_failed(
+                job,
+                "Worker restarted after maximum attempts",
+            )
+            failed += 1
+
+        else:
+            schedule_retry(
+                job,
+                error="Recovered after worker restart",
+                delay=1,
+            )
+            recovered += 1
+
+    db.commit()
+
+    logger.warning(
+        "Recovered stuck processing jobs "
+        "recovered=%s failed=%s",
+        recovered,
+        failed,
+    )
+
+
 def reconcile_accepted_jobs(
     db: Session,
 ) -> None:
@@ -98,6 +153,12 @@ def reconcile_accepted_jobs(
         .limit(BATCH_SIZE)
         .all()
     )
+
+    if jobs:
+        logger.info(
+            "Reconciling %s accepted jobs",
+            len(jobs),
+        )
 
     for job in jobs:
         try:
@@ -171,6 +232,13 @@ def reconcile_accepted_jobs(
                 job.last_error = None
 
                 db.commit()
+
+                logger.info(
+                    "DM still queued "
+                    "job_id=%s dm_id=%s",
+                    job.id,
+                    job.dm_id,
+                )
 
             elif dm_status == "failed":
                 if job.attempts >= MAX_ATTEMPTS:
@@ -630,6 +698,8 @@ def process_jobs(
     Pending jobs are processed concurrently with a bounded
     worker pool. Each job gets its own database session.
     """
+
+    recover_stuck_processing_jobs(db)
 
     reconcile_accepted_jobs(db)
 
