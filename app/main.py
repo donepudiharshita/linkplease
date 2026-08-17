@@ -1,9 +1,8 @@
 import asyncio
 from contextlib import asynccontextmanager
 import logging
-import os
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Header, status
 from sqlalchemy import func, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -16,10 +15,6 @@ from .schemas import RuleCreate, RuleResponse, WebhookEvent
 
 
 logger = logging.getLogger(__name__)
-
-ADMIN_RESET_TOKEN = os.getenv(
-    "ADMIN_RESET_TOKEN",
-)
 
 
 async def background_worker_loop() -> None:
@@ -65,7 +60,7 @@ async def lifespan(app: FastAPI):
     worker_task = None
 
     print(
-        f"APPLICATION_STARTUP "
+        "APPLICATION_STARTUP "
         f"RUN_BACKGROUND_WORKER={RUN_BACKGROUND_WORKER}",
         flush=True,
     )
@@ -422,57 +417,3 @@ def get_stats(
         "queued": queued,
         "duplicates_blocked": duplicates_blocked,
     }
-
-
-@app.post("/admin/reset-test-data")
-def reset_test_data(
-    db: Session = Depends(get_db),
-    x_admin_token: str | None = Header(
-        default=None,
-    ),
-):
-    """
-    TEMPORARY TEST-ENVIRONMENT RESET.
-
-    This endpoint must be removed before final submission.
-    """
-
-    if not ADMIN_RESET_TOKEN:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Not found",
-        )
-
-    if x_admin_token != ADMIN_RESET_TOKEN:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Forbidden",
-        )
-
-    try:
-        db.query(models.DmJob).delete(
-            synchronize_session=False,
-        )
-
-        db.query(models.ProcessedEvent).delete(
-            synchronize_session=False,
-        )
-
-        db.query(models.Rule).delete(
-            synchronize_session=False,
-        )
-
-        db.query(models.Stat).delete(
-            synchronize_session=False,
-        )
-
-        db.commit()
-
-        return {
-            "status": "reset",
-        }
-
-    except Exception:
-        db.rollback()
-        raise
-
